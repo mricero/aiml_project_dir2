@@ -16,7 +16,7 @@ NUM_WORKERS = 4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Ratios of heads to physically remove (0.0 = Baseline)
-PRUNE_RATIOS = [0.0, 0.25, 0.50, 0.75] 
+PRUNE_RATIOS = [0.0 ,0.01 ,0.15, 0.5,] 
 
 def get_dataloaders():
     print(f"Loading dataset from {DATA_FILES}...")
