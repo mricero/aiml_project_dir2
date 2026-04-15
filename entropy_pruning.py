@@ -15,7 +15,8 @@ BATCH_SIZE = 64
 NUM_WORKERS = 4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-PRUNE_RATIOS = [0.1, 0.25, 0.50, 0.75] 
+# Ratios of heads to physically remove (0.0 = Baseline)
+PRUNE_RATIOS = [0.0, 0.25, 0.50, 0.75] 
 
 def get_dataloaders():
     print(f"Loading dataset from {DATA_FILES}...")
@@ -34,6 +35,7 @@ def get_dataloaders():
 
     dataset = dataset.with_transform(preprocess)
     
+    # 500 images for Calibration (Entropy Measurement), remaining for Evaluation
     calib_indices = list(range(500))
     eval_indices = list(range(500, len(dataset)))
     
@@ -44,6 +46,10 @@ def get_dataloaders():
 
 # --- Custom Forward: Phase 1 (Calibration) ---
 def calibrate_attention_forward(self, x, **kwargs):
+    """
+    Temporarily replaces the forward pass of the attention block to capture entropy 
+    during the 500-image calibration phase.
+    """
     B, N, C = x.shape
     head_dim = C // self.num_heads
     
@@ -59,6 +65,7 @@ def calibrate_attention_forward(self, x, **kwargs):
         
     attn = attn.softmax(dim=-1)
 
+    # Calculate Entropy: -sum(p * log(p))
     entropy = -(attn * torch.log(attn + 1e-8)).sum(dim=-1) 
     mean_entropy = entropy.mean(dim=(0, 2)) 
 
@@ -77,6 +84,10 @@ def calibrate_attention_forward(self, x, **kwargs):
 
 # --- Custom Forward: Phase 2 (Inference after Pruning) ---
 def pruned_attention_forward(self, x, **kwargs):
+    """
+    A safe forward pass that mathematically calculates the true head_dim 
+    from the physically sliced layer weights, bypassing timm's assumptions.
+    """
     B, N, C = x.shape
     
     # Calculate true head_dim based on the sliced qkv matrix
@@ -102,6 +113,10 @@ def pruned_attention_forward(self, x, **kwargs):
     return x
 
 def physically_prune_heads(model, prune_ratio):
+    """
+    Identifies the highest-entropy heads and physically slices their dimensions
+    out of the QKV and Projection weight matrices.
+    """
     for block in model.blocks:
         attn = block.attn
         num_heads = attn.num_heads
@@ -176,37 +191,38 @@ def evaluate_model(model, eval_loader, ratio_name):
     return acc, lat, params
 
 def plot_pruning_results(results):
-    """Generates the 2-panel Pareto and Parameter graph automatically."""
+    """Generates the 2-panel Accuracy and Parameter Histogram automatically."""
     ratios = list(results.keys())
     accuracies = [results[r]["Accuracy"] for r in ratios]
-    latencies = [results[r]["Latency (ms)"] for r in ratios]
     params = [results[r]["Params (M)"] for r in ratios]
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
     fig.suptitle('Attention Head Pruning Trade-offs (Standard ViT)', fontsize=16, fontweight='bold')
 
-    # --- Plot 1: Accuracy vs Latency ---
     colors = ['blue', 'orange', 'green', 'red']
-    ax1.plot(latencies, accuracies, linestyle='--', color='gray', zorder=1)
-    
-    for i in range(len(ratios)):
-        ax1.scatter(latencies[i], accuracies[i], color=colors[i], s=150, zorder=2, label=ratios[i])
+    x_pos = range(len(ratios))
+
+    # --- Plot 1: Accuracy Bar Chart ---
+    bars1 = ax1.bar(x_pos, accuracies, color=colors, alpha=0.8, width=0.6)
+    for bar in bars1:
+        height = bar.get_height()
         ax1.annotate(
-            f"{ratios[i]}\n{accuracies[i]:.2f}%", 
-            (latencies[i], accuracies[i]),
-            xytext=(10, 5), textcoords='offset points', fontweight='bold'
+            f'{height:.2f}%',
+            xy=(bar.get_x() + bar.get_width() / 2, height),
+            xytext=(0, 3), textcoords="offset points",
+            ha='center', va='bottom', fontweight='bold'
         )
 
-    ax1.set_title("Accuracy vs. Latency", fontsize=14)
-    ax1.set_xlabel("Average Batch Latency (ms) ↓ [Lower is Better]", fontsize=12)
-    ax1.set_ylabel("Top-1 Accuracy (%) ↑ [Higher is Better]", fontsize=12)
-    ax1.grid(True, linestyle='--', alpha=0.6)
+    ax1.set_title("Top-1 Accuracy", fontsize=14)
+    ax1.set_ylabel("Accuracy (%) ↑ [Higher is Better]", fontsize=12)
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels([f"{r} Pruned" if r != "0%" else "Baseline" for r in ratios], fontsize=11)
+    ax1.grid(axis='y', linestyle='--', alpha=0.6)
+    ax1.set_ylim(0, 100)
 
-    # --- Plot 2: Parameter Count ---
-    x_pos = range(len(ratios))
-    bars = ax2.bar(x_pos, params, color=colors, alpha=0.8, width=0.6)
-
-    for bar in bars:
+    # --- Plot 2: Parameter Count Bar Chart ---
+    bars2 = ax2.bar(x_pos, params, color=colors, alpha=0.8, width=0.6)
+    for bar in bars2:
         height = bar.get_height()
         ax2.annotate(
             f'{height:.2f} M',
@@ -218,12 +234,12 @@ def plot_pruning_results(results):
     ax2.set_title("Physical Parameter Count", fontsize=14)
     ax2.set_ylabel("Total Parameters (Millions) ↓ [Lower is Better]", fontsize=12)
     ax2.set_xticks(x_pos)
-    ax2.set_xticklabels(ratios, fontsize=11)
+    ax2.set_xticklabels([f"{r} Pruned" if r != "0%" else "Baseline" for r in ratios], fontsize=11)
     ax2.grid(axis='y', linestyle='--', alpha=0.6)
     ax2.set_ylim(0, max(params) * 1.15) 
 
     plt.tight_layout()
-    output_filename = "entropy_pruning_metrics.png"
+    output_filename = "entropy_pruning_bars.png"
     plt.savefig(output_filename, dpi=300, bbox_inches='tight')
     print(f"\n[Success] Graph successfully saved as '{output_filename}'!")
 
