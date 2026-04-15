@@ -22,7 +22,7 @@ TOKENS_PER_IMAGE = 197 # 196 patches + 1 CLS token
 
 # --- Master Sweep Grid (24 Combinations) ---
 QUANTIZATIONS = ["FP32", "INT8", "INT4"]
-PRUNE_RATIOS = [0.0, 0.10] # 10% drops exactly 1 of the 6 heads
+PRUNE_RATIOS = [0.0, 0.10] # 10% physically drops 1 of the 6 heads
 TOKEN_REDUCTIONS = ["None", "ToMe_r4", "ToMe_r8", "Mask_75"]
 
 # ==========================================
@@ -45,7 +45,6 @@ def get_dataloaders():
 
     dataset = dataset.with_transform(preprocess)
     
-    # Calibration subset for Pruning (500) and PTQ (subset of calib)
     calib_indices = list(range(500))
     eval_indices = list(range(500, len(dataset)))
     
@@ -55,18 +54,15 @@ def get_dataloaders():
     return calib_loader, eval_loader
 
 # ==========================================
-# 2. Compression Modules (Pruning, Masking, PTQ)
+# 2. Compression Modules
 # ==========================================
-
 class MaskingTokenDropper:
-    """Custom Token Masking Hook (preserves 2D tensor shape for downstream layers)"""
+    """Custom Token Masking Hook (preserves 2D tensor shape)"""
     def __init__(self, keep_ratio):
         self.keep_ratio = keep_ratio
 
     def hook_fn(self, module, input, output):
         if self.keep_ratio >= 1.0: return output 
-        
-        # Handle cases where output might be a tuple (e.g., modified by other hooks)
         is_tuple = isinstance(output, tuple)
         x = output[0] if is_tuple else output
 
@@ -88,19 +84,18 @@ class MaskingTokenDropper:
         
         return (masked_x,) + output[1:] if is_tuple else masked_x
 
-def calibrate_attention_forward(self, x, *args, **kwargs):
+def calibrate_attention_forward(self, x, size=None, **kwargs):
     """Temporary forward pass to measure Attention Entropy."""
     B, N, C = x.shape
-    head_dim = getattr(self, 'head_dim', C // self.num_heads)
+    # CRITICAL FIX: Use out_features instead of weight.shape to avoid INT4 packed tensor crash
+    head_dim = self.qkv.out_features // (3 * self.num_heads)
     
     qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, head_dim).permute(2, 0, 3, 1, 4)
     q, k, v = qkv.unbind(0)
     q = q * self.scale
     attn = (q @ k.transpose(-2, -1))
     
-    if kwargs.get('attn_mask') is not None: 
-        attn = attn + kwargs['attn_mask']
-        
+    if kwargs.get('attn_mask') is not None: attn = attn + kwargs['attn_mask']
     attn = attn.softmax(dim=-1)
 
     entropy = -(attn * torch.log(attn + 1e-8)).sum(dim=-1) 
@@ -114,16 +109,52 @@ def calibrate_attention_forward(self, x, *args, **kwargs):
         self.calib_steps += 1
 
     attn = self.attn_drop(attn)
-    x = (attn @ v).transpose(1, 2).reshape(B, N, self.num_heads * head_dim)
-    x = self.proj(x)
-    x = self.proj_drop(x)
-    return x
+    x_out = (attn @ v).transpose(1, 2).reshape(B, N, self.num_heads * head_dim)
+    x_out = self.proj(x_out)
+    x_out = self.proj_drop(x_out)
+    return x_out
+
+def unified_attention_forward(self, x, size=None, **kwargs):
+    """
+    BULLETPROOF FORWARD PASS.
+    Dynamically handles missing pruned heads AND strictly satisfies Facebook's ToMe Tuple requirements.
+    It reads out_features safely so bitsandbytes 4-bit packing doesn't break the reshape math.
+    """
+    B, N, C = x.shape
+    # CRITICAL FIX: Use out_features instead of weight.shape to avoid INT4 packed tensor crash
+    head_dim = self.qkv.out_features // (3 * self.num_heads)
+    
+    qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, head_dim).permute(2, 0, 3, 1, 4)
+    q, k, v = qkv.unbind(0)
+    q = q * self.scale
+    attn = (q @ k.transpose(-2, -1))
+    
+    # Facebook ToMe Compatibility Mask
+    if size is not None:
+        attn = attn + size.log()[:, None, None, :, 0]
+        
+    if kwargs.get('attn_mask') is not None: 
+        attn = attn + kwargs['attn_mask']
+        
+    attn = attn.softmax(dim=-1)
+    attn = self.attn_drop(attn)
+    
+    x_out = (attn @ v).transpose(1, 2).reshape(B, N, self.num_heads * head_dim)
+    x_out = self.proj(x_out)
+    x_out = self.proj_drop(x_out)
+    
+    # If ToMe is active, return the required Metric Tuple.
+    if getattr(self, 'is_tome_active', False):
+        metric = k.mean(dim=1)
+        return x_out, metric
+        
+    return x_out
 
 def physically_prune_heads(model, prune_ratio):
-    """Physically slices the weight matrices to drop high-entropy heads."""
     for block in model.blocks:
         attn = block.attn
         num_heads = attn.num_heads
+        # Read true out_features before slicing
         head_dim = attn.qkv.out_features // (3 * num_heads)
         num_keep = max(1, int(num_heads * (1 - prune_ratio)))
         
@@ -148,17 +179,19 @@ def physically_prune_heads(model, prune_ratio):
         qkv_idx = torch.tensor(qkv_indices, device=device)
         proj_idx = torch.tensor(proj_indices, device=device)
 
-        # Slice weights
+        # Slice weights 
         attn.qkv.weight = nn.Parameter(torch.index_select(attn.qkv.weight, dim=0, index=qkv_idx))
         if attn.qkv.bias is not None:
             attn.qkv.bias = nn.Parameter(torch.index_select(attn.qkv.bias, dim=0, index=qkv_idx))
         attn.proj.weight = nn.Parameter(torch.index_select(attn.proj.weight, dim=1, index=proj_idx))
         
+        # Explicitly update out_features so Downstream INT4/INT8 layers calibrate correctly
         attn.num_heads = num_keep
+        attn.qkv.out_features = len(qkv_idx)
+        attn.proj.in_features = len(proj_idx)
         del attn.accumulated_entropy, attn.calib_steps
 
 def replace_linear_with_bnb(module, quant_type="int8"):
-    """Dynamically applies Post-Training Quantization (PTQ) to linear layers."""
     for name, child in module.named_children():
         if isinstance(child, nn.Linear):
             has_bias = child.bias is not None
@@ -172,7 +205,6 @@ def replace_linear_with_bnb(module, quant_type="int8"):
             setattr(module, name, quant_layer.to(DEVICE))
         else:
             replace_linear_with_bnb(child, quant_type)
-
 
 # ==========================================
 # 3. Evaluation & Orchestration
@@ -210,7 +242,6 @@ def evaluate_model(model, eval_loader, combo_name):
     return acc, lat, throughput, tok_sec, peak_vram, params
 
 def plot_master_results(results):
-    """Generates the 3-Panel High-Res Graphical Analysis."""
     fig, axes = plt.subplots(1, 3, figsize=(24, 8))
     fig.suptitle('Master Sweep: Interaction Effects (Standard ViT)', fontsize=20, fontweight='bold')
     
@@ -219,7 +250,7 @@ def plot_master_results(results):
     vrams = [results[n]["VRAM"] for n in names]
     quant_colors = {"FP32": "#1f77b4", "INT8": "#ff7f0e", "INT4": "#2ca02c"}
 
-    # --- Plot 1: Pareto Curve (Accuracy vs Latency) ---
+    # Plot 1: Pareto Curve
     ax1 = axes[0]
     for name in names:
         q_type = name.split("|")[0]
@@ -227,7 +258,7 @@ def plot_master_results(results):
     
     handles, labels = ax1.get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
-    ax1.legend(by_label.values(), by_label.keys(), title="Quantization Base", loc="lower left")
+    ax1.legend(by_label.values(), by_label.keys(), title="Quantization", loc="lower left")
     
     ax1.set_title("Pareto Frontier: Accuracy vs Latency", fontsize=16)
     ax1.set_xlabel("Average Batch Latency (ms) ↓", fontsize=14)
@@ -235,7 +266,7 @@ def plot_master_results(results):
     ax1.grid(True, linestyle='--', alpha=0.6)
     ax1.invert_xaxis()
 
-    # --- Plot 2: Peak VRAM Footprint ---
+    # Plot 2: Peak VRAM
     ax2 = axes[1]
     x_pos = np.arange(len(names))
     colors = [quant_colors[n.split("|")[0]] for n in names]
@@ -247,7 +278,7 @@ def plot_master_results(results):
     ax2.set_xticklabels(names, rotation=45, ha="right", fontsize=9)
     ax2.grid(axis='y', linestyle='--', alpha=0.6)
 
-    # --- Plot 3: Accuracy Impact Histogram ---
+    # Plot 3: Accuracy Impact
     ax3 = axes[2]
     ax3.bar(x_pos, accuracies, color=colors, alpha=0.8, edgecolor='black', linewidth=0.5)
     ax3.set_title("Top-1 Accuracy Retention", fontsize=16)
@@ -258,17 +289,16 @@ def plot_master_results(results):
     ax3.set_ylim(0, 100)
 
     plt.tight_layout()
-    output_filename = "master_interaction_sweep.png"
-    plt.savefig(output_filename, dpi=300, bbox_inches='tight')
-    print(f"\n[Success] High-Res 3-Panel Graph saved as '{output_filename}'")
+    plt.savefig("master_interaction_sweep.png", dpi=300, bbox_inches='tight')
+    print(f"\n[Success] High-Res 3-Panel Graph saved as 'master_interaction_sweep.png'")
 
 def main():
     calib_loader, eval_loader = get_dataloaders()
     results = {}
 
-    print(f"\n{'='*110}")
-    print(f"{'STARTING MASTER INTERACTION SWEEP (24 COMBINATIONS)':^110}")
-    print(f"{'='*110}\n")
+    print(f"\n{'='*115}")
+    print(f"{'STARTING MASTER INTERACTION SWEEP (24 COMBINATIONS)':^115}")
+    print(f"{'='*115}\n")
 
     for q in QUANTIZATIONS:
         for p in PRUNE_RATIOS:
@@ -276,61 +306,54 @@ def main():
                 combo_name = f"{q}|P{int(p*100)}|{tr}"
                 print(f"--- Running: {combo_name} ---")
                 
-                # 0. Deep clean memory to prevent VRAM accumulation
+                # Zero out GPU memory 
                 torch.cuda.empty_cache()
                 gc.collect()
 
-                # 1. Load Fresh Base Model
+                # 1. Load Base Model
                 model = timm.create_model('vit_small_patch16_224', pretrained=True).to(DEVICE)
                 hook_handle = None
                 
-                # 2. Apply Pruning (If requested)
+                # 2. Apply Pruning 
                 if p > 0.0:
-                    # Inject calibration hook
-                    for blk in model.blocks: 
-                        blk.attn.forward = types.MethodType(calibrate_attention_forward, blk.attn)
-                    
-                    # Calibrate
+                    for blk in model.blocks: blk.attn.forward = types.MethodType(calibrate_attention_forward, blk.attn)
                     with torch.no_grad():
-                        for batch in tqdm(calib_loader, desc="Calibrating Entropy", leave=False): 
+                        for batch in tqdm(calib_loader, desc="Calibrating", leave=False): 
                             model(batch['image'].to(DEVICE))
-                    
-                    # Physically slice
                     physically_prune_heads(model, p)
-                    
-                    # SAFELY remove the instance hook so it falls back to the native class method
-                    for blk in model.blocks: 
-                        del blk.attn.forward
 
-                # 3. Apply Token Reduction (ToMe OR Custom Mask)
-                if "ToMe" in tr:
+                # 3. Apply ToMe
+                is_tome = "ToMe" in tr
+                if is_tome:
                     r_val = int(tr.split("_r")[1])
                     tome.patch.timm(model)
                     model.r = r_val
-                elif "Mask" in tr:
+
+                # 4. Attach Unified Forward Hook (Safely handles Pruning + ToMe)
+                for blk in model.blocks:
+                    blk.attn.is_tome_active = is_tome  # Explicit Flag
+                    blk.attn.forward = types.MethodType(unified_attention_forward, blk.attn)
+
+                # 5. Apply Token Masking
+                if "Mask" in tr:
                     retention = int(tr.split("_")[1]) / 100.0
                     dropper = MaskingTokenDropper(keep_ratio=retention)
                     hook_handle = model.blocks[5].register_forward_hook(dropper.hook_fn)
 
-                # 4. Apply Quantization (If requested)
+                # 6. Apply Quantization
                 if q != "FP32":
                     quant_type = "int8" if q == "INT8" else "int4"
                     replace_linear_with_bnb(model, quant_type)
-                    # Quick warmup for INT8 dynamic outlier threshold scaling
-                    with torch.no_grad():
-                        for _ in range(3): 
-                            model(next(iter(calib_loader))['image'].to(DEVICE))
+                    with torch.no_grad(): # Warmup
+                        for _ in range(3): model(next(iter(calib_loader))['image'].to(DEVICE))
 
-                # 5. Evaluate the combined stack
+                # 7. Evaluate
                 acc, lat, thru, tok, vram, params = evaluate_model(model, eval_loader, combo_name)
                 results[combo_name] = {"Acc": acc, "Lat": lat, "Thru": thru, "Tok/s": tok, "VRAM": vram, "Params": params}
                 
-                # 6. Cleanup hooks
-                if hook_handle is not None: 
-                    hook_handle.remove()
+                if hook_handle is not None: hook_handle.remove()
                 del model
 
-    # --- Print Final Mega-Matrix ---
     print(f"\n{'='*115}")
     print(f"{'MASTER INTERACTION SWEEP RESULTS':^115}")
     print(f"{'='*115}")
