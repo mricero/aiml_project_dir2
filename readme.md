@@ -79,6 +79,6 @@ Heads with a high mean entropy exhibit uniform, unfocused attention. We physical
  ┣ 📜 custom_drop_sweep.py     # Custom L2-norm threshold token masking hook
  ┣ 📜 entropy_pruning.py       # Shannon entropy calibration and physical QKV slicing
  ┣ 📜 master_sweep.py          # The 24-combination interaction grid search
- ┣ 📜 report.tex               # Comprehensive LaTeX academic report
- ┗ 📜 README.md                # Project documentation
+ ┣ 📜 report.md               # Comprehensive LaTeX academic report
+ ┗ 📜 README.md              # Project documentation
 ```
